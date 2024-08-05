@@ -1,0 +1,311 @@
+CREATE OR REPLACE PACKAGE BODY PK_WEB_SMS IS
+
+ FUNCTION FP_OBTENER_CONF_CODIGO_ACTIVOS RETURN SYS_REFCURSOR IS
+    CONF_CURSOR  SYS_REFCURSOR;
+    V_DIA_SEMANA VARCHAR2(10);
+    PROCEDURE_EXISTS BOOLEAN := FALSE;
+BEGIN
+    -- DETERMINAR EL DÍA DE LA SEMANA ACTUAL
+    SELECT TO_CHAR(SYSDATE, 'DAY', 'NLS_DATE_LANGUAGE = ''SPANISH''')
+    INTO V_DIA_SEMANA
+    FROM DUAL;
+
+    -- QUITAR ESPACIOS EN BLANCO POR ALGUN MOTIVO TRAE SABADO CON TILDE NO QUITAR
+    V_DIA_SEMANA := RTRIM(V_DIA_SEMANA);
+
+    -- Abrir el cursor
+    OPEN CONF_CURSOR FOR
+    SELECT CONF.SMS_COD_CONF, CONF.SMS_CAT_SMS
+    FROM FAC_CONF_SMS CONF
+    WHERE CONF.SMS_ACTIVADO = 'S'
+      AND ((V_DIA_SEMANA = 'LUNES' AND CONF.SMS_LUNES = 'S') OR
+           (V_DIA_SEMANA = 'MARTES' AND CONF.SMS_MARTES = 'S') OR
+           (V_DIA_SEMANA = 'MIÉRCOLES' AND CONF.SMS_MIERCOLES = 'S') OR
+           (V_DIA_SEMANA = 'JUEVES' AND CONF.SMS_JUEVES = 'S') OR
+           (V_DIA_SEMANA = 'VIERNES' AND CONF.SMS_VIERNES = 'S') OR
+           (V_DIA_SEMANA = 'SÁBADO' AND CONF.SMS_SABADO = 'S') OR
+           (V_DIA_SEMANA = 'DOMINGO' AND CONF.SMS_DOMINGO = 'S'))
+      AND CONF.SMS_HORA <= TO_CHAR(SYSDATE, 'HH24:MI:SS')
+      AND TRUNC(SYSDATE) BETWEEN CONF.SMS_FEC_ENVIO AND CONF.SMS_FEC_CADUCIDAD
+      AND EXISTS (
+          SELECT 1
+          FROM ALL_OBJECTS
+          WHERE OBJECT_TYPE = 'PROCEDURE'
+            AND OBJECT_NAME = 'PLANTILLA_SMS' || CONF.SMS_CAT_SMS
+            AND OWNER = 'ADCS' -- Reemplaza con el esquema adecuado
+      );
+
+    RETURN CONF_CURSOR;
+END FP_OBTENER_CONF_CODIGO_ACTIVOS;
+
+
+  ----------------------------------------------------------------------------------------------------------------------------------------
+  --GUARDA EL ENCABEZADO PARA LUEGO UNIRLOS EN FAC_SMS Y FAC_SEND_SMS PARA PODER DARLE SEGUIMIENTO 
+  FUNCTION FP_GENERAR_COD_ENCABEZADO_SMS(I_SEND_CONF_SMS IN NUMBER)
+    RETURN NUMBER AS
+    V_EXISTE_ENC   NUMBER;
+    V_FEC_HOY      DATE;
+    V_MAX_SMS_COD  NUMBER;
+    O_SEND_SMS_COD NUMBER;
+  BEGIN
+    V_FEC_HOY := SYSDATE;
+  
+    SELECT NVL(MAX(SEND_SMS_COD), 0) + 1
+      INTO V_MAX_SMS_COD
+      FROM ADCS.FAC_SMS;
+  
+    SELECT COUNT(SEND_SMS_COD)
+      INTO V_EXISTE_ENC
+      FROM FAC_SMS
+     WHERE SEND_CONF_SMS = I_SEND_CONF_SMS
+       AND TRUNC(SEND_FEC_GRAB) = TRUNC(V_FEC_HOY);
+  
+    IF V_EXISTE_ENC = 0 THEN
+      INSERT INTO FAC_SMS
+        (SEND_SMS_COD, SEND_CONF_SMS, SEND_FEC_GRAB)
+      VALUES
+        (V_MAX_SMS_COD, I_SEND_CONF_SMS, SYSDATE);
+    
+      O_SEND_SMS_COD := V_MAX_SMS_COD;
+    ELSE
+      BEGIN
+      SELECT SEND_SMS_COD
+        INTO V_EXISTE_ENC
+        FROM FAC_SMS 
+       WHERE SEND_CONF_SMS = I_SEND_CONF_SMS
+         AND TRUNC(SEND_FEC_GRAB) = TRUNC(V_FEC_HOY);
+         --AND NVL(SEND_ENVIADO,'N') = 'N';
+         
+          O_SEND_SMS_COD := V_EXISTE_ENC;
+    EXCEPTION WHEN NO_DATA_FOUND THEN
+      O_SEND_SMS_COD:= NULL;
+      END;
+    END IF;
+  
+    RETURN O_SEND_SMS_COD;
+    COMMIT;
+  END FP_GENERAR_COD_ENCABEZADO_SMS;
+  ------------------------------------------------------------------------------------------------------------------------------------------------------
+  --GUARDA EN FAC_SEND_SMS PARA SU POSTERIOR REVISION GUARDANDO POR LOTES EN LAS SGTES SMS_RECORD Y SMS_TABLE 
+  /*
+  CREATE OR REPLACE TYPE SMS_ITEM AS OBJECT (
+    CLI_COD NUMBER,
+    TEXT VARCHAR2(500),
+    TELEFONO VARCHAR2(15),
+    SMS_ID NUMBER,
+    ESTADO VARCHAR2(50)
+);
+
+CREATE OR REPLACE TYPE SMS_TABLE AS TABLE OF SMS_ITEM;
+/
+
+  
+    */
+  -------------------------------------------------------------------------------------------------------------------------
+ 
+ PROCEDURE PP_GENERAR_SMS_LOTE(
+    P_SEND_SMS_COD IN NUMBER,
+    P_SMS_ITEMS IN SMS_TABLE
+) AS
+    V_FILTERED_SMS_DATA SMS_TABLE := SMS_TABLE();
+    V_ITEM NUMBER;
+BEGIN
+    -- FILTRAR LOS DATOS ANTES DE LA INSERCIÓN
+    FOR I IN 1 .. P_SMS_ITEMS.COUNT LOOP
+        IF LENGTH(P_SMS_ITEMS(I).TELEFONO) = 10 THEN
+            V_FILTERED_SMS_DATA.EXTEND;
+            V_FILTERED_SMS_DATA(V_FILTERED_SMS_DATA.COUNT) := P_SMS_ITEMS(I);
+        END IF;
+    END LOOP;
+
+    -- INSERTAR LOS DATOS FILTRADOS POR LOTES UTILIZANDO FORALL
+    FOR J IN 1 .. V_FILTERED_SMS_DATA.COUNT LOOP
+        -- OBTENER EL VALOR DE SEND_ITEM
+        SELECT NVL(MAX(A.SEND_ITEM + 1), 1)
+        INTO V_ITEM
+        FROM FAC_SEND_SMS A
+        WHERE A.SEND_SMS_COD = P_SEND_SMS_COD;
+
+        INSERT INTO FAC_SEND_SMS (
+            SEND_SMS_COD,
+            SEND_SMS_ID,
+            SEND_CLI_COD,
+            SEND_TEXTO,
+            SEND_PHONE,
+            SEND_ESTADO,
+            SEND_PLATFORM,
+            SEND_RESPUESTA,
+            SEND_ITEM
+        ) VALUES (
+            P_SEND_SMS_COD,
+            V_FILTERED_SMS_DATA(J).SMS_ID,
+            V_FILTERED_SMS_DATA(J).CLI_COD,
+            V_FILTERED_SMS_DATA(J).TEXT,
+            V_FILTERED_SMS_DATA(J).TELEFONO,
+            V_FILTERED_SMS_DATA(J).ESTADO,  -- Aquí se guarda el estado
+            '',
+            '',
+            V_ITEM
+        );
+    END LOOP;
+
+    COMMIT;
+END PP_GENERAR_SMS_LOTE;
+  ----------------------------------------------------------------------------------------------------------------------------------------
+  PROCEDURE PP_PROCEDURE_CREATE(I_PROCEDURE IN VARCHAR2,
+                                I_WHERE     IN VARCHAR2,
+                                I_EMPRESA   NUMBER) AS
+    V_SQL    VARCHAR2(4000);
+    V_CODIGO NUMBER;
+  BEGIN
+    -- CONSTRUIR LA SENTENCIA SQL PARA REEMPLAZAR EL PROCEDIMIENTO
+    V_SQL := 'CREATE OR REPLACE PROCEDURE PLANTILLA_SMS' || I_PROCEDURE ||
+             ' (O_CLIENTES OUT SYS_REFCURSOR) AS ' || 'BEGIN ' ||
+             '  OPEN O_CLIENTES FOR SELECT CLI_CODIGO, TELEFONO, NOMBRE ' ||
+             '  FROM PLANTILLA_SMS ' || '  WHERE ' || I_WHERE || '; ' ||
+             'END PLANTILLA_SMS' || I_PROCEDURE || ';';
+    -- EJECUTAR LA SENTENCIA SQL
+    EXECUTE IMMEDIATE V_SQL;
+  
+    SELECT NVL(MAX(AUD_CODIGO + 1), 0)
+      INTO V_CODIGO
+      FROM GEN_AUDITORIA_SMS;
+    INSERT INTO GEN_AUDITORIA_SMS
+      (AUD_CODIGO,
+       AUD_EMPRESA,
+       AUD_USER,
+       AUD_FECHA,
+       AUD_CONSULTA,
+       AUD_CONF_MSJ)
+    VALUES
+      (V_CODIGO,
+       I_EMPRESA,
+       GEN_DEVUELVE_USER,
+       SYSDATE,
+       'SELECT * FROM PLANTILLA_SMS WHERE ' || I_WHERE,
+       I_PROCEDURE);
+  
+  EXCEPTION
+    WHEN OTHERS THEN
+      RAISE_APPLICATION_ERROR(-20001, 'ERROR: ' || SQLERRM);
+  END PP_PROCEDURE_CREATE;
+  PROCEDURE PP_GET_TOTAL_MENSAJES(I_FRACCION       IN VARCHAR2,
+                                  I_NOT_FRACCION   IN VARCHAR2,
+                                  I_CLIENTE        IN VARCHAR2,
+                                  I_NOT_CLIENTE    IN VARCHAR2,
+                                  I_CONTRATO       IN VARCHAR2,
+                                  I_NOT_CONTRATO   IN VARCHAR2,
+                                  I_EMPRESA        IN VARCHAR2,
+                                  I_NOT_EMPRESA    IN VARCHAR2,
+                                  O_TOTAL_MENSAJES OUT NUMBER,
+                                  O_WHERE          OUT VARCHAR2) AS
+    V_QUERY VARCHAR2(1000);
+  BEGIN
+    IF I_FRACCION IS NOT NULL THEN
+      O_WHERE := O_WHERE || 'FRACCION IN (' || I_FRACCION || ') AND ';
+    END IF;
+    IF I_NOT_FRACCION IS NOT NULL THEN
+      O_WHERE := O_WHERE || 'FRACCION NOT IN (' || I_NOT_FRACCION ||
+                 ') AND ';
+    END IF;
+    IF I_CLIENTE IS NOT NULL THEN
+      O_WHERE := O_WHERE || 'CLI_CODIGO IN (' || I_CLIENTE || ') AND ';
+    END IF;
+    IF I_NOT_CLIENTE IS NOT NULL THEN
+      O_WHERE := O_WHERE || 'CLI_CODIGO NOT IN (' || I_NOT_CLIENTE ||
+                 ') AND ';
+    END IF;
+    IF I_CONTRATO IS NOT NULL THEN
+      O_WHERE := O_WHERE || 'ESTADO_CONTRATO IN (' || I_CONTRATO ||
+                 ') AND ';
+    END IF;
+    IF I_NOT_CONTRATO IS NOT NULL THEN
+      O_WHERE := O_WHERE || 'ESTADO_CONTRATO NOT IN (' || I_NOT_CONTRATO ||
+                 ') AND ';
+    END IF;
+    IF I_EMPRESA IS NOT NULL THEN
+      O_WHERE := O_WHERE || 'EMPRESA IN (' || I_EMPRESA || ') AND ';
+    END IF;
+    IF I_NOT_EMPRESA IS NOT NULL THEN
+      O_WHERE := O_WHERE || 'EMPRESA NOT IN (' || I_NOT_EMPRESA || ') AND ';
+    END IF;
+    IF O_WHERE IS NOT NULL THEN
+      O_WHERE := SUBSTR(O_WHERE, 1, LENGTH(O_WHERE) - 5);
+    ELSE
+      O_WHERE := '1=1'; -- SI NO HAY CONDICIONES, MANTENER SIEMPRE VERDADERA
+    END IF;
+  
+    V_QUERY := 'SELECT COUNT(CLI_CODIGO) INTO :TOTAL FROM PLANTILLA_SMS WHERE ' ||
+               O_WHERE;
+  
+    EXECUTE IMMEDIATE V_QUERY
+      INTO O_TOTAL_MENSAJES;
+  END PP_GET_TOTAL_MENSAJES;
+
+  FUNCTION FP_OBTENER_TEXT_CATEGORIA(I_CODIGO IN NUMBER) RETURN VARCHAR2 AS
+    O_TEXTO VARCHAR2(250);
+  BEGIN
+    SELECT SMS.SMS_TEXTO
+      INTO O_TEXTO
+      FROM FAC_CONF_SMS SMS
+     WHERE SMS.SMS_CAT_SMS = I_CODIGO;
+    RETURN O_TEXTO;
+  END FP_OBTENER_TEXT_CATEGORIA;
+
+ 
+  ----------------------------------------------------------------------------------------------------------------------------
+
+  FUNCTION FP_CONSULTAR_PENDIENTES RETURN SYS_REFCURSOR AS
+    O_SMS_PENDIENTE SYS_REFCURSOR;
+  BEGIN
+    OPEN O_SMS_PENDIENTE FOR 'SELECT X.SEND_SMS_COD,
+            X.SEND_ITEM,
+            X.SEND_CLI_COD,
+            X.SEND_SMS_ID,
+            X.SEND_TEXTO,
+            X.SEND_PHONE,
+            X.SEND_ESTADO
+       FROM FAC_SEND_SMS X
+      WHERE X.SEND_SMS_ID IS NULL
+        AND X.SEND_ERROR_CODE IS NULL';
+    RETURN O_SMS_PENDIENTE;
+  END FP_CONSULTAR_PENDIENTES;
+  --------------------------------------------------------------------------------------
+  /* PARA EL UPDATE POR LOTES 
+   CREATE OR REPLACE TYPE SMS_UPDATE_OBJ AS OBJECT (
+      SEND_SMS_COD     NUMBER,
+      SEND_ITEM        NUMBER,
+      CLI_COD          NUMBER,
+      IDS_SMS          VARCHAR2(100),
+      STATUS           VARCHAR2(100),
+      MESSAGE          VARCHAR2(500),
+      PLATFORM_STATUS  VARCHAR2(100)
+  );
+  
+  CREATE OR REPLACE TYPE SMS_UPDATE_TAB IS TABLE OF SMS_UPDATE_OBJ;
+  
+   */
+  ------------------------------------------------------------------------------------------------
+  /*PROCEDURE PP_ACTUALIZAR_ESTADO_SMS_LOTE(P_SMS_UPDATES IN SMS_UPDATE_TAB) AS
+  BEGIN
+    FORALL I IN INDICES OF P_SMS_UPDATES
+      UPDATE FAC_SEND_SMS
+         SET SEND_ESTADO    = P_SMS_UPDATES(I).STATUS,
+             SEND_RESPUESTA = P_SMS_UPDATES(I).MESSAGE,
+             SEND_PLATFORM  = P_SMS_UPDATES(I).PLATFORM_STATUS
+       WHERE SEND_SMS_COD = P_SMS_UPDATES(I).SEND_SMS_COD
+         AND SEND_ITEM = P_SMS_UPDATES(I).SEND_ITEM
+         AND SEND_CLI_COD = P_SMS_UPDATES(I).CLI_COD
+         AND SEND_SMS_ID = P_SMS_UPDATES(I).IDS_SMS;
+    COMMIT;
+  END PP_ACTUALIZAR_ESTADO_SMS_LOTE;*/
+  -------------------------------------------------------------------------------------------------------
+  FUNCTION FP_TERMINAR_CAT_SMS(I_SMS_COD IN NUMBER) RETURN VARCHAR2 AS
+  BEGIN
+    UPDATE FAC_SMS SET SEND_ENVIADO = 'S'
+     WHERE SEND_SMS_COD = I_SMS_COD;
+    RETURN 'CATEGORIA ENVIADO';
+    COMMIT;
+  END FP_TERMINAR_CAT_SMS;
+  
+END PK_WEB_SMS;
