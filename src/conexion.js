@@ -1,14 +1,12 @@
 
-const desa ='';  
-const prod ='';  
-
+require('dotenv').config();
 const oracledb = require('oracledb');
 async function initialize() {
     try {
         await oracledb.createPool({
-            user: 'adcs',
-            password: 'centu',
-            connectString: desa,
+            user: process.env.PROD_DB_USER,
+            password: process.env.PROD_DB_PASSWORD,
+            connectString: process.env.PROD_DB_CONNECTSTRING ,
             poolAlias: 'default', 
         });
         console.log('Database connection pool initialized');
